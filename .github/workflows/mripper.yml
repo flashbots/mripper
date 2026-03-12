@@ -1,0 +1,106 @@
+name: mripper
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Command or script path to execute on the VM"
+        required: true
+        type: string
+      project:
+        description: "GCP project ID"
+        required: false
+        default: "flashbots-tests"
+        type: string
+      image:
+        description: "GCP image"
+        required: false
+        default: "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260225"
+        type: string
+      network:
+        description: "VPC network"
+        required: false
+        default: "default"
+        type: string
+      subnet:
+        description: "VPC subnet"
+        required: false
+        default: "default"
+        type: string
+      sudo:
+        description: "Run command with sudo"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # us-east4-a
+          - zone: us-east4-a
+            machine_type: c3-standard-4
+          - zone: us-east4-a
+            machine_type: c3-standard-22
+          - zone: us-east4-a
+            machine_type: c3-standard-44
+          # us-east5-b
+          - zone: us-east5-b
+            machine_type: c3-standard-4
+          - zone: us-east5-b
+            machine_type: c3-standard-22
+          - zone: us-east5-b
+            machine_type: c3-standard-44
+          # europe-west4-a
+          - zone: europe-west4-a
+            machine_type: c3-standard-4
+          - zone: europe-west4-a
+            machine_type: c3-standard-22
+          - zone: europe-west4-a
+            machine_type: c3-standard-44
+
+    runs-on: ubuntu-latest
+    name: "${{ matrix.zone }} / ${{ matrix.machine_type }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: "${{ secrets.GCP_SA_KEY }}"
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run mripper
+        run: |
+          chmod +x ./mripper.sh
+          ./mripper.sh \
+            --project "${{ inputs.project }}" \
+            --image "${{ inputs.image }}" \
+            --zone "${{ matrix.zone }}" \
+            --machine-type "${{ matrix.machine_type }}" \
+            --network "${{ inputs.network }}" \
+            --subnet "${{ inputs.subnet }}" \
+            ${{ inputs.sudo && '--sudo' || '' }} \
+            '${{ inputs.command }}'
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "mripper: ${{ matrix.zone }} / ${{ matrix.machine_type }}"
+            git pull --rebase
+            git push
+          fi

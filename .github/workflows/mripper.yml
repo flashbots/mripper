@@ -3,10 +3,6 @@ name: mripper
 on:
   workflow_dispatch:
     inputs:
-      command:
-        description: "Command or script path to execute on the VM"
-        required: true
-        type: string
       project:
         description: "GCP project ID"
         required: false
@@ -27,17 +23,18 @@ on:
         required: false
         default: "default"
         type: string
-      sudo:
-        description: "Run command with sudo"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
 
+env:
+  PROJECT: ${{ inputs.project || 'flashbots-tests' }}
+  IMAGE: ${{ inputs.image || 'projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260225' }}
+  NETWORK: ${{ inputs.network || 'default' }}
+  SUBNET: ${{ inputs.subnet || 'default' }}
+
 jobs:
-  run:
+  rip:
     strategy:
       fail-fast: false
       matrix:
@@ -67,40 +64,142 @@ jobs:
     runs-on: ubuntu-latest
     name: "${{ matrix.zone }} / ${{ matrix.machine_type }}"
 
+    env:
+      INSTANCE_NAME: "mripper-${{ matrix.zone }}-${{ matrix.machine_type }}-${{ github.run_id }}"
+      ZONE: ${{ matrix.zone }}
+      MACHINE_TYPE: ${{ matrix.machine_type }}
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           credentials_json: "${{ secrets.GCP_SA_KEY }}"
 
       - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
-      - name: Run mripper
+      - name: Create VM
         run: |
-          chmod +x ./mripper.sh
-          ./mripper.sh \
-            --project "${{ inputs.project }}" \
-            --image "${{ inputs.image }}" \
-            --zone "${{ matrix.zone }}" \
-            --machine-type "${{ matrix.machine_type }}" \
-            --network "${{ inputs.network }}" \
-            --subnet "${{ inputs.subnet }}" \
-            ${{ inputs.sudo && '--sudo' || '' }} \
-            '${{ inputs.command }}'
+          FIREWALL_RULE="mripper-allow-ssh-${INSTANCE_NAME}"
+          echo "FIREWALL_RULE=${FIREWALL_RULE}" >> "$GITHUB_ENV"
+
+          gcloud compute instances create "$INSTANCE_NAME" \
+            --project="$PROJECT" \
+            --zone="$ZONE" \
+            --machine-type="$MACHINE_TYPE" \
+            --image="$IMAGE" \
+            --network="$NETWORK" \
+            --subnet="$SUBNET" \
+            --confidential-compute-type=TDX \
+            --maintenance-policy=TERMINATE \
+            --no-shielded-secure-boot \
+            --no-shielded-vtpm \
+            --boot-disk-size=10GB \
+            --boot-disk-type=pd-balanced \
+            --tags="$INSTANCE_NAME"
+
+          gcloud compute firewall-rules create "$FIREWALL_RULE" \
+            --project="$PROJECT" \
+            --network="$NETWORK" \
+            --allow=tcp:22 \
+            --target-tags="$INSTANCE_NAME" \
+            --direction=INGRESS
+
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 60); do
+            if gcloud compute ssh "$INSTANCE_NAME" \
+              --project="$PROJECT" --zone="$ZONE" \
+              --command="true" --quiet 2>/dev/null; then
+              echo "SSH is ready"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for SSH"
+          exit 1
+
+      - name: Run computed measurement
+        run: |
+          gcloud compute scp ./rip.sh "${INSTANCE_NAME}:/tmp/rip.sh" \
+            --project="$PROJECT" --zone="$ZONE" --quiet
+          gcloud compute ssh "$INSTANCE_NAME" \
+            --project="$PROJECT" --zone="$ZONE" \
+            --command="chmod +x /tmp/rip.sh && sudo /tmp/rip.sh computed"
+
+      - name: Fetch computed measurement
+        run: |
+          mkdir -p mr
+          gcloud compute scp "${INSTANCE_NAME}:/tmp/dcap-computed.json" ./dcap-computed.json \
+            --project="$PROJECT" --zone="$ZONE" --quiet
+
+      - name: Compare with existing measurement
+        id: compare
+        run: |
+          PREFIX="${ZONE}_${MACHINE_TYPE}"
+          # Find the latest existing measurement for this zone/machine combo
+          EXISTING=$(ls -t mr/${PREFIX}_*.json 2>/dev/null | head -1 || true)
+
+          if [[ -n "$EXISTING" ]] && diff -q <(jq -S . "$EXISTING") <(jq -S . ./dcap-computed.json) >/dev/null 2>&1; then
+            echo "Computed DCAP measurement MATCHES existing: $EXISTING"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            if [[ -n "$EXISTING" ]]; then
+              echo "Computed DCAP measurement DIFFERS from existing: $EXISTING"
+            else
+              echo "No existing measurement found for ${PREFIX}"
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run raw measurement
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          gcloud compute ssh "$INSTANCE_NAME" \
+            --project="$PROJECT" --zone="$ZONE" \
+            --command="sudo /tmp/rip.sh raw"
+
+      - name: Fetch raw measurement
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          mkdir -p dcap-raw
+          gcloud compute scp "${INSTANCE_NAME}:/tmp/dcap-raw" ./dcap-raw-result \
+            --project="$PROJECT" --zone="$ZONE" --quiet
+
+      - name: Save results
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          TIMESTAMP=$(date +%Y-%m-%dT%H%M%S)
+          PREFIX="${ZONE}_${MACHINE_TYPE}"
+          cp ./dcap-computed.json "mr/${PREFIX}_${TIMESTAMP}.json"
+          cp ./dcap-raw-result "dcap-raw/${PREFIX}_${TIMESTAMP}"
 
       - name: Commit results
+        if: steps.compare.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
+          TIMESTAMP=$(date +%Y-%m-%dT%H%M%S)
+          PREFIX="${ZONE}_${MACHINE_TYPE}"
+          git add "mr/${PREFIX}_"*.json "dcap-raw/${PREFIX}_"*
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "mripper: ${{ matrix.zone }} / ${{ matrix.machine_type }}"
-            git pull --rebase
-            git push
+            git commit -m "mripper: new measurement for ${PREFIX} (${TIMESTAMP})"
+            # Retry push in case of concurrent matrix jobs
+            for i in 1 2 3 4 5; do
+              git pull --rebase && git push && break
+              sleep $((i * 2))
+            done
           fi
+
+      - name: Cleanup VM
+        if: always()
+        run: |
+          gcloud compute firewall-rules delete "$FIREWALL_RULE" \
+            --project="$PROJECT" --quiet 2>/dev/null || true
+          gcloud compute instances delete "$INSTANCE_NAME" \
+            --project="$PROJECT" --zone="$ZONE" --quiet 2>/dev/null || true

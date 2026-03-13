@@ -65,7 +65,7 @@ jobs:
     name: "${{ matrix.zone }} / ${{ matrix.machine_type }}"
 
     env:
-      INSTANCE_NAME: "mripper-${{ matrix.zone }}-${{ matrix.machine_type }}-${{ github.run_id }}"
+      INSTANCE_NAME: "mr-${{ matrix.zone }}-${{ matrix.machine_type }}-${{ github.run_id }}"
       ZONE: ${{ matrix.zone }}
       MACHINE_TYPE: ${{ matrix.machine_type }}
 
@@ -83,7 +83,7 @@ jobs:
 
       - name: Create VM
         run: |
-          FIREWALL_RULE="mripper-allow-ssh-${INSTANCE_NAME}"
+          FIREWALL_RULE="${INSTANCE_NAME}-ssh"
           echo "FIREWALL_RULE=${FIREWALL_RULE}" >> "$GITHUB_ENV"
 
           gcloud compute instances create "$INSTANCE_NAME" \
@@ -177,23 +177,23 @@ jobs:
           cp ./dcap-computed.json "mr/${PREFIX}_${TIMESTAMP}.json"
           cp ./dcap-raw-result "dcap-raw/${PREFIX}_${TIMESTAMP}"
 
-      - name: Commit results
+      - name: Commit and push
         if: steps.compare.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          TIMESTAMP=$(date +%Y-%m-%dT%H%M%S)
           PREFIX="${ZONE}_${MACHINE_TYPE}"
           git add "mr/${PREFIX}_"*.json "dcap-raw/${PREFIX}_"*
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "mripper: new measurement for ${PREFIX} (${TIMESTAMP})"
-            # Retry push in case of concurrent matrix jobs
+            git commit -m "mripper: new measurement for ${PREFIX}"
             for i in 1 2 3 4 5; do
-              git pull --rebase && git push && break
+              git pull --rebase && git push && exit 0
               sleep $((i * 2))
             done
+            echo "::error::Failed to push after 5 attempts"
+            exit 1
           fi
 
       - name: Cleanup VM

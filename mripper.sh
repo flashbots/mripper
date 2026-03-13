@@ -114,7 +114,7 @@ if [[ -z "$INSTANCE_NAME" ]]; then
     INSTANCE_NAME="mripper-$(date +%s)"
 fi
 
-FIREWALL_RULE="mripper-allow-ssh-${INSTANCE_NAME}"
+FIREWALL_RULE="${INSTANCE_NAME}-ssh"
 
 # ── Determine if COMMAND_ARG is a local script file ──────────────────────────
 

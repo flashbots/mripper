@@ -140,19 +140,39 @@ jobs:
         id: compare
         run: |
           PREFIX="${ZONE}_${MACHINE_TYPE}"
-          # Find the latest existing measurement for this zone/machine combo
-          EXISTING=$(ls -t mr/${PREFIX}_*.json 2>/dev/null | head -1 || true)
+          FILES=$(ls mr/${PREFIX}_*.json 2>/dev/null || true)
 
-          if [[ -n "$EXISTING" ]] && diff -q <(jq -S . "$EXISTING") <(jq -S . ./dcap-computed.json) >/dev/null 2>&1; then
-            echo "Computed DCAP measurement MATCHES existing: $EXISTING"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            if [[ -n "$EXISTING" ]]; then
-              echo "Computed DCAP measurement DIFFERS from existing: $EXISTING"
-            else
-              echo "No existing measurement found for ${PREFIX}"
-            fi
+          if [[ -z "$FILES" ]]; then
+            echo "No existing measurements found for ${PREFIX}"
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            # All registers are new
+            jq -r 'keys[]' ./dcap-computed.json | tr '\n' ',' | sed 's/,$//' > /tmp/changed-registers.txt
+          else
+            MATCHED=""
+            for f in $FILES; do
+              if diff -q <(jq -S . "$f") <(jq -S . ./dcap-computed.json) >/dev/null 2>&1; then
+                MATCHED="$f"
+                break
+              fi
+            done
+            if [[ -n "$MATCHED" ]]; then
+              echo "Computed DCAP measurement MATCHES existing: $MATCHED"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Computed DCAP measurement DIFFERS from all existing measurements"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              # Diff against the latest file to identify which registers changed
+              LATEST=$(ls -t mr/${PREFIX}_*.json | head -1)
+              CHANGED_REGS=""
+              for key in $(jq -r 'keys[]' ./dcap-computed.json); do
+                OLD=$(jq -S --arg k "$key" '.[$k]' "$LATEST")
+                NEW=$(jq -S --arg k "$key" '.[$k]' ./dcap-computed.json)
+                if [[ "$OLD" != "$NEW" ]]; then
+                  CHANGED_REGS="${CHANGED_REGS:+${CHANGED_REGS},}${key}"
+                fi
+              done
+              echo "${CHANGED_REGS:-unknown}" > /tmp/changed-registers.txt
+            fi
           fi
 
       - name: Run raw measurement
@@ -174,8 +194,23 @@ jobs:
         run: |
           TIMESTAMP=$(date +%Y-%m-%dT%H%M%S)
           PREFIX="${ZONE}_${MACHINE_TYPE}"
-          cp ./dcap-computed.json "mr/${PREFIX}_${TIMESTAMP}.json"
-          cp ./dcap-raw-result "dcap-raw/${PREFIX}_${TIMESTAMP}"
+          MR_FILE="mr/${PREFIX}_${TIMESTAMP}.json"
+          RAW_FILE="dcap-raw/${PREFIX}_${TIMESTAMP}"
+          cp ./dcap-computed.json "$MR_FILE"
+          cp ./dcap-raw-result "$RAW_FILE"
+          # Save paths for the change summary artifact
+          echo "$MR_FILE" > /tmp/mr-path.txt
+          echo "$RAW_FILE" > /tmp/raw-path.txt
+
+      - name: Upload change summary
+        if: steps.compare.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "change-${{ matrix.zone }}-${{ matrix.machine_type }}"
+          path: |
+            /tmp/changed-registers.txt
+            /tmp/mr-path.txt
+            /tmp/raw-path.txt
 
       - name: Commit and push
         if: steps.compare.outputs.changed == 'true'
@@ -203,3 +238,89 @@ jobs:
             --project="$PROJECT" --quiet 2>/dev/null || true
           gcloud compute instances delete "$INSTANCE_NAME" \
             --project="$PROJECT" --zone="$ZONE" --quiet 2>/dev/null || true
+
+  notify:
+    needs: rip
+    if: always()
+    runs-on: ubuntu-latest
+    name: Slack notification
+    steps:
+      - name: Download change summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "change-*"
+          path: changes
+        continue-on-error: true
+
+      - name: Build and send Slack message
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # Check if any changes were detected
+          if [[ ! -d changes ]] || [[ -z "$(ls changes/)" ]]; then
+            echo "No measurement changes detected, skipping notification"
+            exit 0
+          fi
+
+          # Build the details section from each artifact
+          # Artifact dirs are named: change-{zone}-{machine_type}
+          DETAILS=""
+          for dir in changes/change-*; do
+            [[ -d "$dir" ]] || continue
+            # Parse zone and machine type from directory name
+            NAME=$(basename "$dir")
+            # Strip "change-" prefix
+            COMBO="${NAME#change-}"
+            # Split on last hyphen-delimited segment that starts with c3
+            # e.g. us-east4-a-c3-standard-4 -> zone=us-east4-a machine=c3-standard-4
+            ZONE=$(echo "$COMBO" | sed 's/-\(c3-.*\)$//')
+            MACHINE=$(echo "$COMBO" | grep -o 'c3-.*')
+            REGISTERS=$(cat "$dir/changed-registers.txt" 2>/dev/null || echo "unknown")
+            MR_PATH=$(cat "$dir/mr-path.txt" 2>/dev/null || true)
+            RAW_PATH=$(cat "$dir/raw-path.txt" 2>/dev/null || true)
+            REPO_URL="${{ github.server_url }}/${{ github.repository }}/blob/main"
+            LINKS=""
+            [[ -n "$MR_PATH" ]] && LINKS="<${REPO_URL}/${MR_PATH}|computed>"
+            [[ -n "$RAW_PATH" ]] && LINKS="${LINKS:+${LINKS}, }<${REPO_URL}/${RAW_PATH}|raw>"
+            DETAILS="${DETAILS}\n• *${ZONE}* / \`${MACHINE}\` — changed: \`${REGISTERS}\` (${LINKS})"
+          done
+
+          if [[ -z "$DETAILS" ]]; then
+            echo "No change details found, skipping notification"
+            exit 0
+          fi
+
+          # Send Slack message
+          PAYLOAD=$(cat <<SLACK
+          {
+            "text": "Measurements changed after a TCB update",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": ":warning: Measurements changed after a TCB update"
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "New DCAP measurements were detected that differ from all previously recorded values. Consider updating your offline measurement tools to support the new TCB.\n${DETAILS}"
+                }
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+                  }
+                ]
+              }
+            ]
+          }
+          SLACK
+          )
+
+          curl -sf -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"

@@ -1,37 +1,24 @@
 name: mripper
 
 on:
+  schedule:
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
-      project:
-        description: "GCP project ID"
-        required: false
-        default: "flashbots-tests"
-        type: string
       image:
         description: "GCP image"
         required: false
         default: "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260225"
-        type: string
-      network:
-        description: "VPC network"
-        required: false
-        default: "default"
-        type: string
-      subnet:
-        description: "VPC subnet"
-        required: false
-        default: "default"
         type: string
 
 permissions:
   contents: write
 
 env:
-  PROJECT: ${{ inputs.project || 'flashbots-tests' }}
+  PROJECT: flashbots-tests
   IMAGE: ${{ inputs.image || 'projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260225' }}
-  NETWORK: ${{ inputs.network || 'default' }}
-  SUBNET: ${{ inputs.subnet || 'default' }}
+  NETWORK: default
+  SUBNET: default
 
 jobs:
   rip:

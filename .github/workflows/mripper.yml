@@ -47,6 +47,13 @@ jobs:
             machine_type: c3-standard-22
           - zone: europe-west4-a
             machine_type: c3-standard-44
+          # asia-northeast1-b
+          - zone: asia-northeast1-b
+            machine_type: c3-standard-4
+          - zone: asia-northeast1-b
+            machine_type: c3-standard-22
+          - zone: asia-northeast1-b
+            machine_type: c3-standard-44
 
     runs-on: ubuntu-latest
     name: "${{ matrix.zone }} / ${{ matrix.machine_type }}"

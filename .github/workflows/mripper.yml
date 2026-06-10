@@ -29,6 +29,8 @@ jobs:
           - zone: us-east4-a
             machine_type: c3-standard-4
           - zone: us-east4-a
+            machine_type: c3-standard-8
+          - zone: us-east4-a
             machine_type: c3-standard-22
           - zone: us-east4-a
             machine_type: c3-standard-44
